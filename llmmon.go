@@ -13,10 +13,14 @@ package llmmon
 import (
 	"bufio"
 	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -43,13 +47,15 @@ func Wrap(opts Options) http.RoundTripper {
 		base = http.DefaultTransport
 	}
 	ep := strings.TrimRight(opts.Endpoint, "/")
-	return &interceptor{
+	t := &interceptor{
 		base:       base,
 		app:        opts.App,
 		feature:    opts.Feature,
 		logPrompts: opts.LogPrompts,
 		exporter:   newExporter(ep),
 	}
+	go t.cleanupRetries()
+	return t
 }
 
 // NewClient returns a pre-wrapped *http.Client.
@@ -65,6 +71,106 @@ type interceptor struct {
 	feature    string
 	logPrompts bool
 	exporter   *exporter
+	retries    sync.Map // fingerprint(string) → *retryEntry
+}
+
+// retryEntry tracks how many times a request with the same fingerprint (method+path+body)
+// has been seen recently — used to detect retries the underlying vendor SDK issues on its
+// own (this transport has no retry logic itself, it only observes).
+type retryEntry struct {
+	mu       sync.Mutex
+	count    int
+	lastSeen time.Time
+}
+
+const retryWindow = 2 * time.Minute
+
+// ── trace linking (opt-in) ───────────────────────────────────────────────────
+//
+// This transport has no knowledge of any APM agent. It only reads a W3C traceparent
+// if one already reaches the outgoing request — either as an HTTP header (e.g. an APM
+// agent's outbound-call instrumentation already injected it, as macmon-apm-java's OkHttp
+// advice does today) or via an explicit context.Context value set through
+// ContextWithTraceparent for callers that carry trace context in Go's context instead.
+
+type traceparentCtxKey struct{}
+
+// ContextWithTraceparent returns a context carrying an explicit W3C traceparent string
+// ("00-{32 hex trace-id}-{16 hex parent-id}-{2 hex flags}"), for callers that don't have
+// it as an outgoing HTTP header. The transport checks the header first, then this value.
+func ContextWithTraceparent(ctx context.Context, traceparent string) context.Context {
+	return context.WithValue(ctx, traceparentCtxKey{}, traceparent)
+}
+
+// extractTraceID pulls the trace-id segment out of a W3C traceparent, checking the
+// request header first and falling back to an explicit context value. Empty if neither
+// is present or malformed — this is best-effort, not a hard requirement.
+func extractTraceID(req *http.Request) string {
+	tp := req.Header.Get("traceparent")
+	if tp == "" {
+		if v, ok := req.Context().Value(traceparentCtxKey{}).(string); ok {
+			tp = v
+		}
+	}
+	if tp == "" {
+		return ""
+	}
+	parts := strings.Split(tp, "-")
+	if len(parts) < 2 || len(parts[1]) != 32 {
+		return ""
+	}
+	return parts[1]
+}
+
+// requestFingerprint identifies "the same logical request" across retry attempts.
+func requestFingerprint(req *http.Request, body []byte) string {
+	h := sha256.New()
+	h.Write([]byte(req.Method))
+	h.Write([]byte(req.URL.Path))
+	h.Write(body)
+	return hex.EncodeToString(h.Sum(nil))[:16]
+}
+
+// bumpRetry returns 0 for a request's first attempt, then 1, 2, ... for each subsequent
+// attempt with the same fingerprint seen within retryWindow. Entries older than the window
+// reset to 0 instead of accumulating forever (a genuinely new call can coincidentally repeat
+// the same body, e.g. an identical prompt sent again later).
+func (t *interceptor) bumpRetry(fp string) int {
+	now := time.Now()
+	v, loaded := t.retries.LoadOrStore(fp, &retryEntry{lastSeen: now})
+	if !loaded {
+		return 0
+	}
+	e := v.(*retryEntry)
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if now.Sub(e.lastSeen) > retryWindow {
+		e.count = 0
+	} else {
+		e.count++
+	}
+	e.lastSeen = now
+	return e.count
+}
+
+// cleanupRetries evicts stale fingerprints so long-running processes don't leak memory
+// across many distinct one-off requests.
+func (t *interceptor) cleanupRetries() {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+	for range ticker.C {
+		now := time.Now()
+		t.retries.Range(func(k, v any) bool {
+			e := v.(*retryEntry)
+			e.mu.Lock()
+			stale := now.Sub(e.lastSeen) > retryWindow
+			e.mu.Unlock()
+			if stale {
+				t.retries.Delete(k)
+			}
+			return true
+		})
+	}
 }
 
 func (t *interceptor) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -79,6 +185,8 @@ func (t *interceptor) RoundTrip(req *http.Request) (*http.Response, error) {
 		req.Body = io.NopCloser(bytes.NewReader(reqBody))
 	}
 
+	retryCount := t.bumpRetry(requestFingerprint(req, reqBody))
+	traceID := extractTraceID(req)
 	isStream := isStreamingReq(reqBody)
 	start := time.Now()
 
@@ -86,6 +194,8 @@ func (t *interceptor) RoundTrip(req *http.Request) (*http.Response, error) {
 	if err != nil {
 		rec := makeRecord(provider, reqBody, nil, 0, time.Since(start).Milliseconds(), 0, t.app, t.feature, t.logPrompts)
 		rec.Error = err.Error()
+		rec.RetryCount = retryCount
+		rec.TraceID = traceID
 		t.exporter.send(rec)
 		return resp, err
 	}
@@ -93,15 +203,17 @@ func (t *interceptor) RoundTrip(req *http.Request) (*http.Response, error) {
 	if isStream && resp.StatusCode == 200 {
 		// Wrap body to measure TTFT while streaming.
 		wrapped := &streamingBody{
-			rc:       resp.Body,
-			start:    start,
-			provider: provider,
-			reqBody:  reqBody,
-			app:      t.app,
-			feature:  t.feature,
+			rc:         resp.Body,
+			start:      start,
+			provider:   provider,
+			reqBody:    reqBody,
+			app:        t.app,
+			feature:    t.feature,
 			logPrompts: t.logPrompts,
-			exporter: t.exporter,
-			status:   resp.StatusCode,
+			exporter:   t.exporter,
+			status:     resp.StatusCode,
+			retryCount: retryCount,
+			traceID:    traceID,
 		}
 		resp.Body = wrapped
 		return resp, nil
@@ -111,6 +223,8 @@ func (t *interceptor) RoundTrip(req *http.Request) (*http.Response, error) {
 	respBody, _ := io.ReadAll(resp.Body)
 	resp.Body = io.NopCloser(bytes.NewReader(respBody))
 	rec := makeRecord(provider, reqBody, respBody, resp.StatusCode, time.Since(start).Milliseconds(), 0, t.app, t.feature, t.logPrompts)
+	rec.RetryCount = retryCount
+	rec.TraceID = traceID
 	t.exporter.send(rec)
 	return resp, nil
 }
@@ -131,6 +245,8 @@ type streamingBody struct {
 	exporter   *exporter
 	status     int
 	done       bool
+	retryCount int
+	traceID    string
 }
 
 func (s *streamingBody) Read(p []byte) (int, error) {
@@ -146,6 +262,8 @@ func (s *streamingBody) Read(p []byte) (int, error) {
 		s.done = true
 		latency := time.Since(s.start).Milliseconds()
 		rec := parseStreamRecord(s.provider, s.reqBody, s.buf.Bytes(), s.status, latency, s.ttftMs, s.app, s.feature, s.logPrompts)
+		rec.RetryCount = s.retryCount
+		rec.TraceID = s.traceID
 		s.exporter.send(rec)
 	}
 	return n, err
@@ -156,6 +274,8 @@ func (s *streamingBody) Close() error {
 		s.done = true
 		latency := time.Since(s.start).Milliseconds()
 		rec := parseStreamRecord(s.provider, s.reqBody, s.buf.Bytes(), s.status, latency, s.ttftMs, s.app, s.feature, s.logPrompts)
+		rec.RetryCount = s.retryCount
+		rec.TraceID = s.traceID
 		s.exporter.send(rec)
 	}
 	return s.rc.Close()
@@ -193,25 +313,28 @@ func isStreamingReq(body []byte) bool {
 
 // CallRecord is a single LLM API call record sent to macmon-server.
 type CallRecord struct {
-	Timestamp       string        `json:"timestamp"`
-	Provider        string        `json:"provider"`
-	Model           string        `json:"model"`
-	App             string        `json:"app"`
-	Feature         string        `json:"feature,omitempty"`
-	PromptTok       int           `json:"prompt_tokens"`
-	CompleteTok     int           `json:"completion_tokens"`
-	TotalTok        int           `json:"total_tokens"`
-	CacheReadTok    int           `json:"cache_read_tokens,omitempty"`
-	CacheWriteTok   int           `json:"cache_write_tokens,omitempty"`
-	LatencyMs       int64         `json:"latency_ms"`
-	TTFTMs          int64         `json:"ttft_ms,omitempty"`
-	StatusCode      int           `json:"status_code"`
-	CostUSD         float64       `json:"cost_usd"`
-	Streaming       bool          `json:"streaming,omitempty"`
-	ToolCalls       []ToolCallRec `json:"tool_calls,omitempty"`
-	PromptText      string        `json:"prompt_text,omitempty"`
-	ResponseText    string        `json:"response_text,omitempty"`
-	Error           string        `json:"error,omitempty"`
+	Timestamp     string        `json:"timestamp"`
+	Provider      string        `json:"provider"`
+	Model         string        `json:"model"`
+	App           string        `json:"app"`
+	Feature       string        `json:"feature,omitempty"`
+	PromptTok     int           `json:"prompt_tokens"`
+	CompleteTok   int           `json:"completion_tokens"`
+	TotalTok      int           `json:"total_tokens"`
+	CacheReadTok  int           `json:"cache_read_tokens,omitempty"`
+	CacheWriteTok int           `json:"cache_write_tokens,omitempty"`
+	LatencyMs     int64         `json:"latency_ms"`
+	TTFTMs        int64         `json:"ttft_ms,omitempty"`
+	StatusCode    int           `json:"status_code"`
+	CostUSD       float64       `json:"cost_usd"`
+	Streaming     bool          `json:"streaming,omitempty"`
+	ToolCalls     []ToolCallRec `json:"tool_calls,omitempty"`
+	PromptText    string        `json:"prompt_text,omitempty"`
+	ResponseText  string        `json:"response_text,omitempty"`
+	Error         string        `json:"error,omitempty"`
+	ErrorCode     string        `json:"error_code,omitempty"`
+	RetryCount    int           `json:"retry_count,omitempty"`
+	TraceID       string        `json:"trace_id,omitempty"`
 }
 
 // ToolCallRec records a single function/tool call within an LLM response.
@@ -245,7 +368,7 @@ type openaiUsage struct {
 }
 
 type genericResp struct {
-	Model   string `json:"model"`
+	Model string `json:"model"`
 	// OpenAI
 	Usage   openaiUsage `json:"usage"`
 	Choices []struct {
@@ -253,7 +376,9 @@ type genericResp struct {
 			Content   string `json:"content"`
 			ToolCalls []struct {
 				ID       string `json:"id"`
-				Function struct{ Name string `json:"name"` } `json:"function"`
+				Function struct {
+					Name string `json:"name"`
+				} `json:"function"`
 			} `json:"tool_calls"`
 		} `json:"message"`
 		Delta struct {
@@ -268,8 +393,12 @@ type genericResp struct {
 		Name string `json:"name"`
 		ID   string `json:"id"`
 	} `json:"content"`
+	// Error: message는 모든 공급자 공통. Type은 OpenAI/Anthropic/Groq/Mistral/OpenRouter류(공통 REST 관례),
+	// Status는 Gemini("RESOURCE_EXHAUSTED" 등) 전용 필드명이라 따로 둠 — 우선순위는 호출부에서 결정.
 	Error *struct {
 		Message string `json:"message"`
+		Type    string `json:"type,omitempty"`
+		Status  string `json:"status,omitempty"`
 	} `json:"error,omitempty"`
 }
 
@@ -335,6 +464,11 @@ func makeRecord(provider string, reqBody, respBody []byte, status int, latencyMs
 			}
 			if rp.Error != nil {
 				rec.Error = rp.Error.Message
+				if rp.Error.Type != "" {
+					rec.ErrorCode = rp.Error.Type
+				} else {
+					rec.ErrorCode = rp.Error.Status
+				}
 			}
 		}
 	}
@@ -507,6 +641,36 @@ func pricePer1M(provider, model string) (float64, float64) {
 		}
 	case "groq":
 		return 0.10, 0.10
+	case "cohere":
+		switch {
+		case strings.Contains(m, "r7b"):
+			return 0.0375, 0.15
+		case strings.Contains(m, "r-plus"), strings.Contains(m, "r+"):
+			return 2.50, 10.00
+		case strings.Contains(m, "command-a"):
+			return 2.50, 10.00
+		case strings.Contains(m, "command-r"):
+			return 0.50, 1.50
+		case strings.Contains(m, "light"):
+			return 0.30, 0.60
+		}
+	case "openrouter":
+		// OpenRouter는 자체 마진 없이 하위 모델 가격을 그대로 패스스루 —
+		// "vendor/model" 형태의 모델명에서 vendor를 떼어 기존 표를 재사용한다.
+		if vendor, rest, found := strings.Cut(m, "/"); found {
+			switch vendor {
+			case "openai":
+				return pricePer1M("openai", rest)
+			case "anthropic":
+				return pricePer1M("anthropic", rest)
+			case "google":
+				return pricePer1M("gemini", rest)
+			case "mistralai", "mistral":
+				return pricePer1M("mistral", rest)
+			case "cohere":
+				return pricePer1M("cohere", rest)
+			}
+		}
 	}
 	return 0, 0
 }
