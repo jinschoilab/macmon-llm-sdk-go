@@ -11,15 +11,17 @@ import (
 // exporter batches CallRecords and ships them to macmon-server asynchronously.
 type exporter struct {
 	endpoint string
+	token    string
 	mu       sync.Mutex
 	buf      []CallRecord
 	client   *http.Client
 	once     sync.Once
 }
 
-func newExporter(endpoint string) *exporter {
+func newExporter(endpoint, token string) *exporter {
 	e := &exporter{
 		endpoint: endpoint,
+		token:    token,
 		client:   &http.Client{Timeout: 5 * time.Second},
 	}
 	return e
@@ -62,6 +64,9 @@ func (e *exporter) flush() {
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if e.token != "" {
+		req.Header.Set("Authorization", "Bearer "+e.token)
+	}
 	resp, err := e.client.Do(req)
 	if err != nil {
 		return

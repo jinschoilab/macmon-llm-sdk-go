@@ -5,6 +5,7 @@
 //
 //	client := &http.Client{Transport: llmmon.Wrap(llmmon.Options{
 //	    Endpoint:   "http://macmon-server:8280",
+//	    Token:      os.Getenv("MACMON_LLM_INGEST_TOKEN"),
 //	    App:        "my-service",
 //	    LogPrompts: true, // optional: log prompt/response bodies
 //	})}
@@ -19,6 +20,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -28,6 +30,8 @@ import (
 type Options struct {
 	// Endpoint is the macmon-server base URL (e.g. "http://localhost:8280").
 	Endpoint string
+	// Token authenticates telemetry ingestion. When empty, MACMON_LLM_INGEST_TOKEN is used.
+	Token string
 	// App is the application name tag sent with every call record.
 	App string
 	// Feature tags the product feature (e.g. "chat", "briefing"). Optional.
@@ -47,12 +51,16 @@ func Wrap(opts Options) http.RoundTripper {
 		base = http.DefaultTransport
 	}
 	ep := strings.TrimRight(opts.Endpoint, "/")
+	token := opts.Token
+	if token == "" {
+		token = os.Getenv("MACMON_LLM_INGEST_TOKEN")
+	}
 	t := &interceptor{
 		base:       base,
 		app:        opts.App,
 		feature:    opts.Feature,
 		logPrompts: opts.LogPrompts,
-		exporter:   newExporter(ep),
+		exporter:   newExporter(ep, token),
 	}
 	go t.cleanupRetries()
 	return t
