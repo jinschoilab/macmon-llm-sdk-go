@@ -4,7 +4,7 @@
 // Usage:
 //
 //	client := &http.Client{Transport: llmmon.Wrap(llmmon.Options{
-//	    Endpoint:   "http://macmon-server:8280",
+//	    Endpoint:   "http://macmon-server:6600", // collector port, same as the agent (8280 also accepted)
 //	    Token:      os.Getenv("MACMON_LLM_INGEST_TOKEN"),
 //	    App:        "my-service",
 //	    LogPrompts: true, // optional: log prompt/response bodies
@@ -28,7 +28,7 @@ import (
 
 // Options configures the SDK.
 type Options struct {
-	// Endpoint is the macmon-server base URL (e.g. "http://localhost:8280").
+	// Endpoint is the macmon collector base URL (e.g. "http://macmon-server:6600"; :8280 also works).
 	Endpoint string
 	// Token authenticates telemetry ingestion. When empty, MACMON_LLM_INGEST_TOKEN is used.
 	Token string
