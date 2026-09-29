@@ -362,23 +362,25 @@ type genericReq struct {
 	} `json:"messages"`
 }
 
-type anthropicUsage struct {
+// usageBlock merges the OpenAI and Anthropic usage shapes into one struct. They must be
+// one struct: two fields tagged `json:"usage"` at the same level make encoding/json
+// ignore both, which silently zeroed every token count before this fix.
+type usageBlock struct {
+	// Anthropic
 	InputTokens              int `json:"input_tokens"`
 	OutputTokens             int `json:"output_tokens"`
 	CacheReadInputTokens     int `json:"cache_read_input_tokens"`
 	CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
-}
-
-type openaiUsage struct {
+	// OpenAI
 	PromptTokens     int `json:"prompt_tokens"`
 	CompletionTokens int `json:"completion_tokens"`
 	TotalTokens      int `json:"total_tokens"`
 }
 
 type genericResp struct {
-	Model string `json:"model"`
+	Model string     `json:"model"`
+	Usage usageBlock `json:"usage"`
 	// OpenAI
-	Usage   openaiUsage `json:"usage"`
 	Choices []struct {
 		Message struct {
 			Content   string `json:"content"`
@@ -394,8 +396,7 @@ type genericResp struct {
 		} `json:"delta"`
 	} `json:"choices"`
 	// Anthropic
-	AnthUsage anthropicUsage `json:"usage"`
-	Content   []struct {
+	Content []struct {
 		Type string `json:"type"`
 		Text string `json:"text"`
 		Name string `json:"name"`
@@ -443,12 +444,12 @@ func makeRecord(provider string, reqBody, respBody []byte, status int, latencyMs
 				rec.TotalTok = rp.Usage.TotalTokens
 			}
 			// Anthropic tokens
-			if rp.AnthUsage.InputTokens > 0 || rp.AnthUsage.OutputTokens > 0 {
-				rec.PromptTok = rp.AnthUsage.InputTokens
-				rec.CompleteTok = rp.AnthUsage.OutputTokens
-				rec.TotalTok = rp.AnthUsage.InputTokens + rp.AnthUsage.OutputTokens
-				rec.CacheReadTok = rp.AnthUsage.CacheReadInputTokens
-				rec.CacheWriteTok = rp.AnthUsage.CacheCreationInputTokens
+			if rp.Usage.InputTokens > 0 || rp.Usage.OutputTokens > 0 {
+				rec.PromptTok = rp.Usage.InputTokens
+				rec.CompleteTok = rp.Usage.OutputTokens
+				rec.TotalTok = rp.Usage.InputTokens + rp.Usage.OutputTokens
+				rec.CacheReadTok = rp.Usage.CacheReadInputTokens
+				rec.CacheWriteTok = rp.Usage.CacheCreationInputTokens
 			}
 			// Tool calls (OpenAI)
 			if len(rp.Choices) > 0 {
@@ -535,13 +536,13 @@ func parseStreamRecord(provider string, reqBody, sseBody []byte, status int, lat
 			rec.TotalTok = chunk.Usage.TotalTokens
 		}
 		// Anthropic streaming usage (message_delta event)
-		if chunk.AnthUsage.OutputTokens > 0 {
-			rec.CompleteTok = chunk.AnthUsage.OutputTokens
+		if chunk.Usage.OutputTokens > 0 {
+			rec.CompleteTok = chunk.Usage.OutputTokens
 		}
-		if chunk.AnthUsage.InputTokens > 0 {
-			rec.PromptTok = chunk.AnthUsage.InputTokens
-			rec.CacheReadTok = chunk.AnthUsage.CacheReadInputTokens
-			rec.CacheWriteTok = chunk.AnthUsage.CacheCreationInputTokens
+		if chunk.Usage.InputTokens > 0 {
+			rec.PromptTok = chunk.Usage.InputTokens
+			rec.CacheReadTok = chunk.Usage.CacheReadInputTokens
+			rec.CacheWriteTok = chunk.Usage.CacheCreationInputTokens
 		}
 	}
 	if rec.TotalTok == 0 {
