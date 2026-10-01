@@ -24,3 +24,19 @@ func TestMakeRecordParsesUsage(t *testing.T) {
 		t.Fatalf("stream usage not parsed: %+v", stream)
 	}
 }
+
+// Regression: Anthropic streaming puts input/cache tokens in message_start's message.usage,
+// not at the top level — they used to be recorded as 0 (cost under-reported).
+func TestParseStreamRecordMessageStartUsage(t *testing.T) {
+	sse := "event: message_start\n" +
+		"data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-opus-5-5\",\"usage\":{\"input_tokens\":120,\"cache_read_input_tokens\":300,\"cache_creation_input_tokens\":40,\"output_tokens\":1}}}\n\n" +
+		"event: message_delta\n" +
+		"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":42}}\n\n"
+	rec := parseStreamRecord("anthropic", []byte(`{"stream":true}`), []byte(sse), 200, 80, 30, "app", "", false)
+	if rec.PromptTok != 120 || rec.CacheReadTok != 300 || rec.CacheWriteTok != 40 || rec.CompleteTok != 42 {
+		t.Fatalf("message_start usage not parsed: %+v", rec)
+	}
+	if rec.Model != "claude-opus-5-5" {
+		t.Fatalf("model not taken from message_start: %q", rec.Model)
+	}
+}

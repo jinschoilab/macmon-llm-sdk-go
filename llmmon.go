@@ -380,6 +380,11 @@ type usageBlock struct {
 type genericResp struct {
 	Model string     `json:"model"`
 	Usage usageBlock `json:"usage"`
+	// Anthropic 스트리밍 message_start: 입력/캐시 토큰이 최상위가 아닌 message.usage 안에 온다
+	Message *struct {
+		Model string     `json:"model"`
+		Usage usageBlock `json:"usage"`
+	} `json:"message,omitempty"`
 	// OpenAI
 	Choices []struct {
 		Message struct {
@@ -524,6 +529,16 @@ func parseStreamRecord(provider string, reqBody, sseBody []byte, status int, lat
 		}
 		if rec.Model == "" && chunk.Model != "" {
 			rec.Model = chunk.Model
+		}
+		if m := chunk.Message; m != nil {
+			if rec.Model == "" && m.Model != "" {
+				rec.Model = m.Model
+			}
+			if m.Usage.InputTokens > 0 {
+				rec.PromptTok = m.Usage.InputTokens
+				rec.CacheReadTok = m.Usage.CacheReadInputTokens
+				rec.CacheWriteTok = m.Usage.CacheCreationInputTokens
+			}
 		}
 		// Accumulate text delta
 		if len(chunk.Choices) > 0 {
